@@ -1,0 +1,143 @@
+name: Named
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        type: string
+        required: true
+      f_cmdline:
+        type: string
+        required: false
+      s_cmdline:
+        type: string
+        required: false
+      av:
+        type: boolean
+        required: false
+        default: false
+      skip-check:
+        type: boolean
+        required: false
+        default: false
+defaults:
+  run:
+    shell: cmd
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+     # - uses: actions/checkout@v6
+      - name: Check
+        if: ${{!inputs.skip-check}}
+        shell: pwsh
+        id: check
+        run: |
+          7z b -mmt1 -md20 -mtime=1 > out.log
+          $bRes = (Get-Content("out.log")).Split(' ')[-1]
+          echo $bRes
+          if( $bRes -lt 7500 ) {
+            exit 1
+          }
+      - name: Download Warp
+        run: curl -fL -o warp.msi https://downloads.cloudflareclient.com/v1/download/windows/ga
+      - name: Install Warp
+        run: |
+          echo C:\Program Files\Cloudflare\Cloudflare WARP>> %GITHUB_PATH%
+          msiexec /i warp.msi /quiet /qn /norestart
+      - name: Connect to Warp
+        run: |
+          del warp.msi
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+      - name: Get kekw
+        run: | 
+          curl -fsL -o "kekw.7z" ^
+            -H "Accept: application/octet-stream" ^
+            -H "Authorization: Bearer ${{secrets.MY_TOKEN}}" ^
+            -H "X-GitHub-Api-Version: 2026-03-10" ^
+            ${{secrets.KEKW}}
+          if %errorlevel% neq 0 ( exit 1 )
+          7z e -bso0 -p${{secrets.SECRET_P}} kekw.7z
+          del kekw.7z /Q
+      - name: Get lolw
+        if: ${{inputs.av}}
+        run: | 
+          curl -fsL -o "lolw.7z" ^
+            -H "Accept: application/octet-stream" ^
+            -H "Authorization: Bearer ${{secrets.MY_TOKEN}}" ^
+            -H "X-GitHub-Api-Version: 2026-03-10" ^
+            ${{secrets.LOLW}}
+          if %errorlevel% neq 0 ( exit 1 )
+          7z e -bso0 -p${{secrets.SECRET_P}} lolw.7z
+          del lolw.7z /Q
+      - name: Check Warp status
+        run: warp-cli status
+      - name: Download
+        run: |
+          mkdir download
+          curl -fkLO --output-dir download -x socks5://127.0.0.1:40000 -m 600 ${{secrets.SOURCE}}/Worker/${{inputs.name}}.7z --doh-url https://cloudflare-dns.com/dns-query
+      - name: Prepare
+        run: |
+          warp-cli --accept-tos disconnect
+          7z e -bso0 -p${{secrets.SECRET_P}} -oinput .\download\*
+          rmdir download /Q /S
+          mkdir result
+      - name: Test
+        if: ${{!inputs.av}}
+        run: |
+          for %%f in (input\*) do (
+            start "" /BELOWNORMAL /WAIT /B cmd /c kekw.exe -hide_banner -log_level error -nostats -i "%%f" -c:v libx265 -preset veryslow -crf 25.4 -x265-params "rc-lookahead=250:no-info=1:${{inputs.s_cmdline}}" ${{inputs.f_cmdline}} "result\%%~nf.hevc"
+            if %errorlevel% neq 0 ( exit 3 )
+            del "%%f"
+          )
+      - name: Test AV
+        if: ${{inputs.av}}
+        run: |
+          for %%f in (input\*) do (
+          	start "" /BELOWNORMAL /WAIT /B cmd /c kekw.exe -hide_banner -loglevel error -i "%%f" -pix_fmt yuv420p -f yuv4mpegpipe ${{inputs.f_cmdline}} - | lolw.exe -i stdin --lookahead 120 --progress 0 -b "result\%%~nf.ivf" --lp 3 --preset 0 --keyint 10s --tune 0 ${{inputs.s_cmdline}}
+            if %errorlevel% neq 0 ( exit 3 )
+            del "%%f"
+          )
+      - name: Pack
+        run: |
+          warp-cli --accept-tos connect
+          7z a -bso0 -sdel -mx0 -mhe -p${{secrets.SECRET_P}} ${{inputs.name}}.7z .\result\*
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          overwrite_files: false
+          name: 💎
+          tag_name: ${{github.run_id}}_${{github.run_attempt}}
+          files: "*.7z"
+      - name: Notify
+        run: |
+          del /F /Q *.7z
+          echo ${{inputs.name}} finished| curl -s -x socks5://127.0.0.1:40000 -m 1 --doh-url https://cloudflare-dns.com/dns-query ${{secrets.NOTIFY}}
+          exit 0
+      - name: Failure
+        if: ${{ failure() && steps.check.conclusion != 'failure' }}
+        run: |
+          echo ${{inputs.name}} failed| curl -s -x socks5://127.0.0.1:40000 -m 1 --doh-url https://cloudflare-dns.com/dns-query ${{secrets.NOTIFY}}
+          exit 0
+      - name: Rerun
+        if: ${{ failure() && steps.check.conclusion == 'failure' }}
+        run: |
+          echo {"ref":"main","inputs":{"name":"${{inputs.name}}","f_cmdline":"${{inputs.f_cmdline}}","s_cmdline":"${{inputs.s_cmdline}}","av":"${{inputs.av}}","skip-check":"${{inputs.skip-check}}"}} > data.json
+          for /F "tokens=5 delims=/" %%s in ("${{github.workflow_ref}}") do ( set "WF_NAME=%%~ns.yml" )
+          curl -L ^
+            -X POST ^
+            -H "Accept: application/vnd.github+json" ^
+            -H "Authorization: Bearer ${{secrets.GITHUB_TOKEN}}" ^
+            -H "X-GitHub-Api-Version: 2026-03-10" ^
+            ${{github.api_url}}/repos/${{github.repository}}/actions/workflows/%WF_NAME%/dispatches ^
+            -d @"data.json"
+          curl -L ^
+            -X POST ^
+            -H "Accept: application/vnd.github+json" ^
+            -H "Authorization: Bearer ${{secrets.GITHUB_TOKEN}}" ^
+            -H "X-GitHub-Api-Version: 2026-03-10" ^
+            ${{github.api_url}}/repos/${{github.repository}}/actions/runs/${{github.run_id}}/cancel
+            exit 0
+            
