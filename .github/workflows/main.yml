@@ -1,0 +1,188 @@
+name: Main
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        type: string
+        required: true
+      f_cmdline:
+        type: string
+      s_cmdline:
+        type: string
+      av:
+        type: boolean
+      skip-check:
+        type: boolean
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check
+        if: ${{!inputs.skip-check}}
+        shell: pwsh
+        id: check
+        run: |
+          7z b -mmt1 -md20 -mtime=1 | ForEach-Object { $result = $_ }
+          $result = $result.Split(' ')[-1]
+          $result
+          if ($result -lt 7500) {
+            exit 1
+          }
+      - name: Download Warp
+        run: curl --fail-with-body -sSLo warp.msi https://downloads.cloudflareclient.com/v1/download/windows/ga
+      - name: Install Warp
+        run: |
+          "C:\Program Files\Cloudflare\Cloudflare WARP" | Out-File -FilePath "$env:GITHUB_PATH" -Append
+          Start-Process msiexec.exe -ArgumentList '/i "warp.msi" /qn /norestart' -Verb RunAs -Wait
+      - name: Get tooling
+        run: |
+          del warp.msi
+          curl -fsSLo "tooling.7z" `
+            -H "Accept: application/octet-stream" `
+            -H "Authorization: Bearer ${{secrets.MY_TOKEN}}" `
+            -H "X-GitHub-Api-Version: 2026-03-10" `
+            ${{secrets.KEKW}}
+          if (!$?) { exit 1 }
+          7z e -bso0 -p${{secrets.SECRET_P}} -ot tooling.7z
+          del tooling.7z
+      - name: Connect to Warp
+        run: |
+          warp-cli --accept-tos registration new
+          warp-cli mode warp+doh
+          warp-cli tunnel ip add-range 0.0.0.0/0
+          warp-cli connect
+      - name: Check Warp
+        run: |
+          sleep 1
+          warp-cli status
+          curl.exe -4sS https://www.cloudflare.com/cdn-cgi/trace | where { $_.StartsWith("ip=") }
+          curl.exe -6sS https://www.cloudflare.com/cdn-cgi/trace | where { $_.StartsWith("ip=") }
+      - name: Download
+        run: curl -kfsSLO -m 600 ${{secrets.SOURCE}}/Worker/${{inputs.name}}.7z
+      - name: Extract
+        run: 7z e -bso0 -p${{secrets.SECRET_P}} -oinput *.7z 
+      - name: Test
+        run: |
+          del *.7z
+          mkdir output > $nul
+          $udpclient = [System.Net.Sockets.UdpClient]::new([System.Net.Sockets.AddressFamily]::InterNetworkV6)
+          $udpclient.Connect("${{secrets.N_HOST}}", ${{secrets.N_PORT}})
+          if ('${{inputs.av}}' -eq 'false') {
+              $params = '-c:v libx265 -preset veryslow -crf 25.8 -x265-params "rc-lookahead=250:no-info=1'
+              $ext = 'hevc'
+          } else {
+              $params = '-c:v libsvtav1 -preset 0 -svtav1-params "tune=0:lookahead=120:keyint=10s'
+              $ext = 'ivf'
+          }
+          $cmdline = 't\kekw.exe -hide_banner -log_level error -nostats -stats_period 2 -progress pipe:1 -i "input\$($_.Name)" '
+          $cmdline += ($params + ':${{inputs.s_cmdline}}" ${{inputs.f_cmdline}} "output\$($_.BaseName).' + $ext + '"')
+          $sb = [scriptblock]::Create($cmdline)
+          dir "input" | ForEach-Object {
+              t\huhw.exe -hide_banner -v error -select_streams v:0 -show_entries stream_tags=NUMBER_OF_FRAMES:stream=nb_frames -of default=noprint_wrappers=1:nokey=1 "input\$($_.Name)" | ForEach-Object {
+                  if ($null -eq $frames) {
+                      $frames = $_ -as [UInt64]
+                  }
+              }
+              if ($null -eq $frames) {
+                  Write-Warning "Counting frames"
+                  $frames = t\huhw.exe -hide_banner -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=noprint_wrappers=1:nokey=1 "input\$($_.Name)" | ForEach-Object { $_ -as [UInt64] }
+              }
+              if ($null -eq $frames) { 
+                  exit 1
+              } elseif (!$frames) {
+                  Write-Error "Frames are 0"
+                  exit 1
+              }
+              "Frames: " + $frames
+              $name = $_.BaseName
+              &$sb | ForEach-Object {
+                  function to_float($val) {
+                      $f = $val -as [float]
+                      if ($null -eq $f) {
+                          Write-Warning $_
+                      }
+                      $f
+                  }
+                  $split = $_.Split('=')
+                  $key = $split[0]
+                  $val = $split[1]
+                  if ($key -eq "progress" -and $fps -and $frame) {
+                      $ts = New-TimeSpan -Seconds (($frames - $frame) / $fps)
+                      $rem = ""
+                      if ($ts.Days) { $rem += "$($ts.Days)d " }
+                      if ($ts.Hours) { $rem += "$($ts.Hours)h " }
+                      if ($ts.Minutes) { $rem += "$($ts.Minutes)m " }
+                      $rem += [string]$ts.Seconds + "s"
+                      $payload = ([pscustomobject]@{
+                          id = ${{github.run_id}}
+                          name = $name
+                          fps = $fps
+                          progress = [Math]::Round($frame / $frames * 100.0, 1)
+                          rem = $rem
+                      } | ConvertTo-Json -Compress -Depth 10) + "`n"
+                      $fps = $frame = $null
+                      try { 
+                          $null = $udpclient.Send([System.Text.Encoding]::UTF8.GetBytes($payload))
+                      } catch {}
+                  } elseif ($key -eq "fps") {
+                      $fps = to_float($val)
+                  } elseif ($key -eq "frame") {
+                      $frame = to_float($val)
+                  }
+              }
+              if (!$?) { exit 3 }
+              del $_
+          }
+      - name: Disconnect Warp
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          warp-cli disconnect *> $null
+          rd input -Recurse -Force *> $null
+          rd t -Recurse -Force *> $null
+      - name: Pack
+        run: |
+          dir "output" | ForEach-Object { $archive += $_.BaseName + ' ' }
+          7z a -bso0 -sdel -mx0 -mhe -p${{secrets.SECRET_P}} "$($archive.Substring(0, $archive.Length)).7z" .\output\*
+      - name: Cleanup
+        if: ${{ always() }}
+        continue-on-error: true
+        run: rd output -Recurse -Force *> $null
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          overwrite_files: false
+          name: 💎
+          tag_name: ${{github.run_id}}_${{github.run_attempt}}
+          files: "*.7z"
+      - name: Rerun
+        if: ${{ failure() && steps.check.conclusion == 'failure' }}
+        run: |
+          $wf_name = "${{github.workflow_ref}}".Split('@')[0] | Split-Path -Leaf
+          [pscustomobject]@{
+              ref = "main"
+              inputs = @{
+                  name = "${{inputs.name}}"
+                  f_cmdline = "${{inputs.f_cmdline}}"
+                  s_cmdline = "${{inputs.s_cmdline}}"
+                  av = "${{inputs.av}}"
+                  "skip-check" = "${{inputs.skip-check}}"
+              }
+          } | ConvertTo-Json -Compress -Depth 10 > payload.json
+          curl -sSL --fail-with-body `
+            -X POST `
+            -H "Accept: application/vnd.github+json" `
+            -H "Authorization: Bearer ${{secrets.GITHUB_TOKEN}}" `
+            -H "X-GitHub-Api-Version: 2026-03-10" `
+            ${{github.api_url}}/repos/${{github.repository}}/actions/workflows/$wf_name/dispatches `
+            -d@"payload.json"
+          if (!$?) { exit 1 }
+          curl -sSL --fail-with-body `
+            -X POST `
+            -H "Accept: application/vnd.github+json" `
+            -H "Authorization: Bearer ${{secrets.GITHUB_TOKEN}}" `
+            -H "X-GitHub-Api-Version: 2026-03-10" `
+            ${{github.api_url}}/repos/${{github.repository}}/actions/runs/${{github.run_id}}/cancel
+            exit 0
+            
