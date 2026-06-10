@@ -22,7 +22,6 @@ jobs:
       - name: Prepare
         shell: cmd
         run: |
-          goto BEGIN
           winget install Cloudflare.Warp --accept-source-agreements --accept-package-agreements --disable-interactivity --silent
           set "PATH=%PATH%;C:\Program Files\Cloudflare\Cloudflare WARP"
           warp-cli --accept-tos registration new
